@@ -422,12 +422,12 @@ def set_default_kwargs(kwargs, names, pretrained_cfg):
         if n == 'img_size':
             input_size = pretrained_cfg.get('input_size', None)
             if input_size is not None:
-                assert len(input_size) == 3
+                assert len(input_size) == 3  or len(input_size) == 4
                 kwargs.setdefault(n, input_size[-2:])
         elif n == 'in_chans':
             input_size = pretrained_cfg.get('input_size', None)
             if input_size is not None:
-                assert len(input_size) == 3
+                assert len(input_size) == 3 or len(input_size) == 4
                 kwargs.setdefault(n, input_size[0])
         else:
             default_val = pretrained_cfg.get(n, None)

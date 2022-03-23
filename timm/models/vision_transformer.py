@@ -31,7 +31,7 @@ import torch.utils.checkpoint
 
 from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD, IMAGENET_INCEPTION_MEAN, IMAGENET_INCEPTION_STD
 from .helpers import build_model_with_cfg, resolve_pretrained_cfg, named_apply, adapt_input_conv, checkpoint_seq
-from .layers import PatchEmbed, Mlp, DropPath, trunc_normal_, lecun_normal_
+from .layers import PatchEmbed, PatchEmbed3D, Mlp, DropPath, trunc_normal_, lecun_normal_
 from .registry import register_model
 
 _logger = logging.getLogger(__name__)
@@ -74,6 +74,8 @@ default_cfgs = {
     'vit_base_patch32_224': _cfg(
         url='https://storage.googleapis.com/vit_models/augreg/'
             'B_32-i21k-300ep-lr_0.001-aug_medium1-wd_0.03-do_0.0-sd_0.0--imagenet2012-steps_20k-lr_0.03-res_224.npz'),
+    'vit_base_patch32_224_3d': _cfg(
+        input_size=(3, 3, 224, 224)),
     'vit_base_patch32_384': _cfg(
         url='https://storage.googleapis.com/vit_models/augreg/'
             'B_32-i21k-300ep-lr_0.001-aug_light1-wd_0.1-do_0.0-sd_0.0--imagenet2012-steps_20k-lr_0.03-res_384.npz',
@@ -634,6 +636,15 @@ def vit_base_patch32_224(pretrained=False, **kwargs):
     """
     model_kwargs = dict(patch_size=32, embed_dim=768, depth=12, num_heads=12, **kwargs)
     model = _create_vision_transformer('vit_base_patch32_224', pretrained=pretrained, **model_kwargs)
+    return model
+
+@register_model
+def vit_base_patch32_224_3d(pretrained=False, **kwargs):
+    """ ViT-Base (ViT-B/32) from original paper (https://arxiv.org/abs/2010.11929).
+    ImageNet-1k weights fine-tuned from in21k, source https://github.com/google-research/vision_transformer.
+    """
+    model_kwargs = dict(patch_size=32, embed_dim=768, depth=12, num_heads=12, embed_layer=PatchEmbed3D, **kwargs)
+    model = _create_vision_transformer('vit_base_patch32_224_3d', pretrained=pretrained, **model_kwargs)
     return model
 
 

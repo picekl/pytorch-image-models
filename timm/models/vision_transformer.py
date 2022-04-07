@@ -49,6 +49,7 @@ def _cfg(url='', **kwargs):
 
 
 default_cfgs = {
+    'tax_former': _cfg(url='', num_classes=[1000, 250, 100]),
     # patch models (weights from official Google JAX impl)
     'vit_tiny_patch16_224': _cfg(
         url='https://storage.googleapis.com/vit_models/augreg/'
@@ -223,6 +224,136 @@ class Block(nn.Module):
         x = x + self.drop_path1(self.attn(self.norm1(x)))
         x = x + self.drop_path2(self.mlp(self.norm2(x)))
         return x
+
+class TaxTransformer(nn.Module):
+    """ Vision Transformer
+
+    A PyTorch impl of : `An Image is Worth 16x16 Words: Transformers for Image Recognition at Scale`
+        - https://arxiv.org/abs/2010.11929
+
+    Includes distillation token & head support for `DeiT: Data-efficient Image Transformers`
+        - https://arxiv.org/abs/2012.12877
+    """
+
+    def __init__(self, img_size=224, patch_size=16, in_chans=3, num_classes=1000, embed_dim=768, depth=12,
+                 num_heads=12, mlp_ratio=4., qkv_bias=True, representation_size=None, distilled=False,
+                 drop_rate=0., attn_drop_rate=0., drop_path_rate=0., embed_layer=PatchEmbed, norm_layer=None,
+                 act_layer=None, weight_init=''):
+        """
+        Args:
+            img_size (int, tuple): input image size
+            patch_size (int, tuple): patch size
+            in_chans (int): number of input channels
+            num_classes (int): number of classes for classification head
+            embed_dim (int): embedding dimension
+            depth (int): depth of transformer
+            num_heads (int): number of attention heads
+            mlp_ratio (int): ratio of mlp hidden dim to embedding dim
+            qkv_bias (bool): enable bias for qkv if True
+            representation_size (Optional[int]): enable and set representation layer (pre-logits) to this value if set
+            distilled (bool): model includes a distillation token and head as in DeiT models
+            drop_rate (float): dropout rate
+            attn_drop_rate (float): attention dropout rate
+            drop_path_rate (float): stochastic depth rate
+            embed_layer (nn.Module): patch embedding layer
+            norm_layer: (nn.Module): normalization layer
+            weight_init: (str): weight init scheme
+        """
+        super().__init__()
+        self.num_species = num_classes[0]
+        self.num_genus = num_classes[1]
+        self.num_family = num_classes[2]
+
+        self.num_features = self.embed_dim = embed_dim  # num_features for consistency with other models
+        self.num_tokens = 3
+        norm_layer = norm_layer or partial(nn.LayerNorm, eps=1e-6)
+        act_layer = act_layer or nn.GELU
+
+        self.patch_embed = embed_layer(
+            img_size=img_size, patch_size=patch_size, in_chans=in_chans, embed_dim=embed_dim)
+        num_patches = self.patch_embed.num_patches
+
+        self.species_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        self.genus_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        self.family_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+
+        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + self.num_tokens, embed_dim))
+        self.pos_drop = nn.Dropout(p=drop_rate)
+
+        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]  # stochastic depth decay rule
+        self.blocks = nn.Sequential(*[
+            Block(
+                dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, drop=drop_rate,
+                attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer, act_layer=act_layer)
+            for i in range(depth)])
+        self.norm = norm_layer(embed_dim)
+
+        self.pre_logits = nn.Identity()
+
+        # Classifier head(s)
+        self.species_head = nn.Linear(self.num_features, self.num_species)
+        self.genus_head = nn.Linear(self.num_features, self.num_genus)
+        self.family_head = nn.Linear(self.num_features, self.num_family)
+
+        self.init_weights(weight_init)
+
+    def init_weights(self, mode=''):
+        assert mode in ('jax', 'jax_nlhb', 'nlhb', '')
+        head_bias = -math.log(self.num_classes) if 'nlhb' in mode else 0.
+
+        trunc_normal_(self.pos_embed, std=.02)
+
+        trunc_normal_(self.species_token, std=.02)
+        trunc_normal_(self.genus_token, std=.02)
+        trunc_normal_(self.family_token, std=.02)
+
+        self.apply(_init_vit_weights)
+
+    def _init_weights(self, m):
+        # this fn left here for compat with downstream users
+        _init_vit_weights(m)
+
+    @torch.jit.ignore()
+    def load_pretrained(self, checkpoint_path, prefix=''):
+        _load_weights(self, checkpoint_path, prefix)
+
+    @torch.jit.ignore
+    def no_weight_decay(self):
+        return {'pos_embed', 'cls_token', 'dist_token'}
+
+    def get_classifier(self):
+        if self.dist_token is None:
+            return self.head
+        else:
+            return self.head, self.head_dist
+
+    def reset_classifier(self, num_classes, global_pool=''):
+        self.num_classes = num_classes
+        self.head = nn.Linear(self.embed_dim, num_classes) if num_classes > 0 else nn.Identity()
+
+        self.head_dist = nn.Linear(self.embed_dim, self.num_classes) if num_classes > 0 else nn.Identity()
+
+    def forward_features(self, x):
+
+        x = self.patch_embed(x)
+
+        species_token = self.species_token.expand(x.shape[0], -1, -1)
+        genus_token = self.genus_token.expand(x.shape[0], -1, -1)
+        family_token = self.family_token.expand(x.shape[0], -1, -1)
+
+        x = torch.cat((species_token, genus_token, family_token, x), dim=1)
+
+        x = self.pos_drop(x + self.pos_embed)
+        x = self.blocks(x)
+        x = self.norm(x)
+
+        return self.pre_logits(x[:, 0]), self.pre_logits(x[:, 1]), self.pre_logits(x[:, 2])
+
+    def forward(self, x):
+        x = self.forward_features(x)
+
+        return self.species_head(x[0]), self.genus_head(x[1]), self.family_head(x[2])
+
 
 
 class VisionTransformer(nn.Module):
@@ -427,6 +558,40 @@ def get_init_weights_vit(mode='jax', head_bias: float = 0.):
         return init_weights_vit_timm
 
 
+def _init_vit_weights(module: nn.Module, name: str = '', head_bias: float = 0., jax_impl: bool = False):
+    """ ViT weight initialization
+    * When called without n, head_bias, jax_impl args it will behave exactly the same
+      as my original init for compatibility with prev hparam / downstream use cases (ie DeiT).
+    * When called w/ valid n (module name) and jax_impl=True, will (hopefully) match JAX impl
+    """
+    if isinstance(module, nn.Linear):
+        if name.startswith('head'):
+            nn.init.zeros_(module.weight)
+            nn.init.constant_(module.bias, head_bias)
+        elif name.startswith('pre_logits'):
+            lecun_normal_(module.weight)
+            nn.init.zeros_(module.bias)
+        else:
+            if jax_impl:
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    if 'mlp' in name:
+                        nn.init.normal_(module.bias, std=1e-6)
+                    else:
+                        nn.init.zeros_(module.bias)
+            else:
+                trunc_normal_(module.weight, std=.02)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+    elif jax_impl and isinstance(module, nn.Conv2d):
+        # NOTE conv was left to pytorch default in my original init
+        lecun_normal_(module.weight)
+        if module.bias is not None:
+            nn.init.zeros_(module.bias)
+    elif isinstance(module, (nn.LayerNorm, nn.GroupNorm, nn.BatchNorm2d)):
+        nn.init.zeros_(module.bias)
+        nn.init.ones_(module.weight)
+
 @torch.no_grad()
 def _load_weights(model: VisionTransformer, checkpoint_path: str, prefix: str = ''):
     """ Load weights from .npz checkpoints for official Google Brain Flax implementation
@@ -548,7 +713,7 @@ def checkpoint_filter_fn(state_dict, model):
     return out_dict
 
 
-def _create_vision_transformer(variant, pretrained=False, **kwargs):
+def _create_vision_transformer(variant, tax_former=None, pretrained=False, **kwargs):
     if kwargs.get('features_only', None):
         raise RuntimeError('features_only not implemented for Vision Transformer models.')
 
@@ -563,13 +728,31 @@ def _create_vision_transformer(variant, pretrained=False, **kwargs):
         _logger.warning("Removing representation layer for fine-tuning.")
         repr_size = None
 
-    model = build_model_with_cfg(
-        VisionTransformer, variant, pretrained,
-        pretrained_cfg=pretrained_cfg,
-        representation_size=repr_size,
-        pretrained_filter_fn=checkpoint_filter_fn,
-        pretrained_custom_load='npz' in pretrained_cfg['url'],
-        **kwargs)
+    if tax_former:
+        model = build_model_with_cfg(
+            TaxTransformer, variant, pretrained,
+            pretrained_cfg=pretrained_cfg,
+            representation_size=repr_size,
+            pretrained_filter_fn=checkpoint_filter_fn,
+            pretrained_custom_load='npz' in pretrained_cfg['url'],
+            **kwargs)
+    else:
+        model = build_model_with_cfg(
+            VisionTransformer, variant, pretrained,
+            pretrained_cfg=pretrained_cfg,
+            representation_size=repr_size,
+            pretrained_filter_fn=checkpoint_filter_fn,
+            pretrained_custom_load='npz' in pretrained_cfg['url'],
+            **kwargs)
+    return model
+
+
+@register_model
+def tax_former(pretrained=False, **kwargs):
+    """ ViT-Small (ViT-S/32)
+    """
+    model_kwargs = dict(patch_size=32, embed_dim=384, depth=12, num_heads=6, **kwargs)
+    model = _create_vision_transformer('tax_former', pretrained=pretrained, tax_former=True, **model_kwargs)
     return model
 
 
